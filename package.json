@@ -1,0 +1,16 @@
+{
+  "name": "notebooklm-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for Google NotebookLM via Firefox — connects to your own browser so VPN, cookies, and extensions work",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "firefox": "start \"\" \"C:\\Program Files\\Mozilla Firefox\\firefox.exe\" --remote-debugging-port 9222"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.9.0",
+    "playwright": "^1.60.0",
+    "dotenv": "^16.4.0"
+  }
+}
