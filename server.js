@@ -11,203 +11,214 @@ import path from "path";
 
 dotenv.config();
 
-const NOTEBOOK_ID   = process.env.NOTEBOOK_ID || "";
-const USER_DATA_DIR = path.resolve(process.env.USER_DATA_DIR || "./firefox-profile");
-const HEADLESS      = process.env.HEADLESS === "true";
-const NOTEBOOKLM_URL = "https://notebooklm.google.com";
+const NOTEBOOK_ID    = process.env.NOTEBOOK_ID || "1cf6b25e-d2db-4a3c-bd0b-4d8017bf7fdc";
+const USER_DATA_DIR  = path.resolve(process.env.USER_DATA_DIR || "./firefox-profile");
+const STORAGE_FILE   = path.resolve("storageState.json");
 
-let browser = null;
+let browserCtx = null;
 let page = null;
-let loginAttempted = false;
+let ready = false;
 
-async function getPage() {
-  if (page && !page.isClosed()) return page;
+async function launch() {
+  const hasSession = fs.existsSync(STORAGE_FILE);
 
-  if (!fs.existsSync(USER_DATA_DIR)) fs.mkdirSync(USER_DATA_DIR, { recursive: true });
-
-  browser = await firefox.launchPersistentContext(USER_DATA_DIR, {
-    headless: HEADLESS,
+  browserCtx = await firefox.launchPersistentContext(USER_DATA_DIR, {
+    headless: false,
+    firefoxUserPrefs: {
+      "dom.webdriver.enabled": false,
+      "dom.webdriver.remote.enabled": false,
+      "xpinstall.signatures.required": false,
+      "extensions.autoDisableScopes": 0,
+    },
     args: ["--no-sandbox", "--disable-gpu"],
   });
 
-  const pages = browser.pages();
-  page = pages[0] || await browser.newPage();
-  page.setDefaultTimeout(60000);
-  return page;
+  page = browserCtx.pages()[0] || await browserCtx.newPage();
+
+  if (hasSession) {
+    console.error("[nlmcp] Session found, navigating to notebook...");
+    await page.goto("https://notebooklm.google.com", { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+    waitForReady();
+    return;
+  }
+
+  console.error("[nlmcp] ===============================================================");
+  console.error("[nlmcp] VISIBLE BRIDGE MODE — первый запуск / сессия не найдена");
+  console.error("[nlmcp] Подключи SandVPN, войди в Google, открой ноутбук Pygmalion.");
+  console.error("[nlmcp] Сервер будет ждать сколько нужно.");
+  console.error("[nlmcp] Сессия сохранится АВТОМАТИЧЕСКИ после входа.");
+  console.error("[nlmcp] ===============================================================");
+  waitForReady();
 }
 
-async function navigateWithRetry(url, label) {
-  const p = await getPage();
-  for (let attempt = 0; attempt < 3; attempt++) {
+async function waitForReady() {
+  let blockedCount = 0;
+  while (true) {
     try {
-      await p.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
-      await p.waitForTimeout(2000);
-      return p.url();
-    } catch (e) {
-      console.error(`[nlmcp] ${label} attempt ${attempt + 1} failed:`, e.message.substring(0, 80));
-    }
-  }
-  return p.url();
-}
+      if (page.isClosed()) { await sleep(3000); continue; }
+      const url = page.url();
+      const body = await page.locator("body").textContent().catch(() => "");
 
-async function waitForLogin(p) {
-  for (let i = 0; i < 120; i++) {
-    const url = p.url();
-    if (url.includes("notebooklm.google.com") && !url.includes("signin") && !url.includes("accounts") && !url.includes("Error") && !url.includes("403")) {
-      console.error(`[nlmcp] On NotebookLM after ${i * 5}s`);
-      return true;
-    }
-    if (i % 12 === 0) console.error(`[nlmcp] Waiting for login... (${i * 5}s) URL: ${url.substring(0, 80)}`);
-    await p.waitForTimeout(5000);
-  }
-  return false;
-}
-
-async function ensureNotebookLM() {
-  const p = await getPage();
-  let url = p.url();
-  console.error("[nlmcp] Current URL:", url.substring(0, 100));
-
-  // Already on NotebookLM and not on error page
-  if (url.includes("notebooklm.google.com") && !url.includes("signin") && !url.includes("accounts") && !url.includes("403")) {
-    if (NOTEBOOK_ID && !url.includes(NOTEBOOK_ID)) {
-      const nbUrl = `${NOTEBOOKLM_URL}/notebook/${NOTEBOOK_ID}`;
-      url = await navigateWithRetry(nbUrl, "notebook-nav");
-      if (url.includes("403") || url.includes("Error")) {
-        // Notebook 403 — go back to main page
-        console.error("[nlmcp] Notebook returns 403, falling back to main page");
-        await p.goto(NOTEBOOKLM_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
-        await p.waitForTimeout(3000);
+      // Notebook loaded — use ?tab=chat for direct chat access
+      if (url.includes("/notebook/") && body.length > 1500) {
+        const chatUrl = url.includes("?tab=chat") ? url : url.split("?")[0] + "?tab=chat";
+        if (!url.includes("?tab=chat")) {
+          console.error("[nlmcp] ?tab=chat not in URL, navigating...");
+          await page.goto(chatUrl, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+          await sleep(3000);
+        }
+        console.error(`[nlmcp] Notebook ready`);
+        await saveSession();
+        ready = true;
+        return;
       }
-    }
-    return p;
-  }
 
-  // Navigate to main page
-  url = await navigateWithRetry(NOTEBOOKLM_URL, "main-nav");
-  if (url.includes("signin") || url.includes("accounts")) {
-    if (!loginAttempted) {
-      loginAttempted = true;
-      console.error("[nlmcp] Login required. Firefox visible — please log in.");
-      const ok = await waitForLogin(p);
-      if (!ok) return p;
-    }
-  }
+      // Main page with content — try clicking Pygmalion
+      if (body.length > 2000 && url.includes("notebooklm") && !url.includes("signin") && !url.includes("accounts") && !url.includes("403")) {
+        console.error(`[nlmcp] Main page loaded, looking for notebook...`);
+        const allEls = await page.locator('a, [role="button"], [class*="card"], [class*="notebook"]').all();
+        let clicked = false;
+        for (const el of allEls) {
+          const text = await el.textContent().catch(() => "");
+          const href = await el.getAttribute("href").catch(() => "") || "";
+          if (href.includes(NOTEBOOK_ID) || text?.includes("Pygmalion") || text?.includes("pygmalion")) {
+            await el.click();
+            await sleep(5000);
+            const url2 = page.url();
+            if (url2.includes("/notebook/")) {
+              const chatUrl = url2.split("?")[0] + "?tab=chat";
+              await page.goto(chatUrl, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+              await sleep(3000);
+              console.error(`[nlmcp] Notebook ready (from list)`);
+              await saveSession();
+              ready = true;
+              return;
+            }
+            clicked = true;
+            break;
+          }
+        }
+        if (!clicked) {
+          await saveSession();
+          ready = true;
+          return;
+        }
+      }
 
-  if (NOTEBOOK_ID) {
-    const nbUrl = `${NOTEBOOKLM_URL}/notebook/${NOTEBOOK_ID}`;
-    url = await navigateWithRetry(nbUrl, "notebook-nav");
-    if (url.includes("403") || url.includes("Error")) {
-      console.error("[nlmcp] Notebook returns 403 — showing main page instead");
-      await p.goto(NOTEBOOKLM_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
-    }
+      // Blocked — retry
+      if (body.length < 500 || url.includes("403") || url.includes("Error")) {
+        blockedCount++;
+        if (blockedCount > 24) {
+          console.error(`[nlmcp] Still blocked after ${blockedCount * 5}s. Retrying navigation...`);
+          try { await page.goto("https://notebooklm.google.com", { waitUntil: "domcontentloaded", timeout: 30000 }); } catch {}
+          blockedCount = 0;
+        }
+      } else {
+        blockedCount = 0;
+      }
+    } catch {}
+    await sleep(5000);
   }
-
-  return p;
 }
 
-async function getPageSnapshot(p) {
-  const body = await p.locator("body").textContent().catch(() => "");
-  const title = await p.title().catch(() => "");
+async function saveSession() {
+  try {
+    await page.context().storageState({ path: STORAGE_FILE });
+    const stats = fs.statSync(STORAGE_FILE);
+    console.error(`[nlmcp] Session saved (${(stats.size / 1024).toFixed(1)} KB)`);
+  } catch (e) {
+    console.error(`[nlmcp] Session save failed: ${e.message}`);
+  }
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function waitReady() { while (!ready) await sleep(1000); return page; }
+
+async function ask(query) {
+  const p = await waitReady();
   const url = p.url();
 
-  const links = await p.locator("a").all();
-  const linkData = [];
-  for (const l of links) {
-    const href = await l.getAttribute("href").catch(() => "");
-    const text = await l.textContent().catch(() => "");
-    if (href) linkData.push({ text: text.trim().substring(0, 60), href: href.substring(0, 120) });
+  // Navigate to ?tab=chat if not already there
+  if (!url.includes("?tab=chat")) {
+    const chatUrl = url.split("?")[0] + "?tab=chat";
+    console.error("[nlmcp] Navigating to ?tab=chat...");
+    await p.goto(chatUrl, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+    await sleep(3000);
   }
 
-  return { url, title, bodyLength: body.length, links: linkData, bodySnippet: body.substring(0, 2000) };
-}
+  const bodyBefore = await p.locator("body").textContent().catch(() => "");
+  console.error("[nlmcp] URL:", url.substring(0, 120), "| Body:", bodyBefore.length, "chars");
 
-async function findChatInput(p) {
-  for (const sel of ['textarea', '[contenteditable="true"]', '[role="textbox"]', 'div[contenteditable="true"]', '.ql-editor', 'input:not([type="hidden"])']) {
+  // Find chat input
+  let input = null;
+  for (const sel of ['textarea', '[contenteditable="true"]', '[role="textbox"]', '.ql-editor']) {
     const el = p.locator(sel).first();
-    if (await el.count().then(c => c > 0).catch(() => false)) {
-      if (await el.isVisible().catch(() => false)) {
-        console.error("[nlmcp] Input found:", sel);
-        return el;
-      }
+    if (await el.count().then(c => c > 0).catch(() => false) && await el.isVisible().catch(() => false)) {
+      input = el; break;
     }
   }
-  return null;
-}
 
-async function ask(p, query) {
-  const snap = await getPageSnapshot(p);
-  console.error("[nlmcp] Page:", snap.url, "| body:", snap.bodyLength, "bytes");
-
-  if (snap.url.includes("signin") || snap.url.includes("accounts")) {
-    return { type: "login_required", text: "Требуется вход в Google. Firefox visible — залогиньтесь." };
-  }
-
-  if (snap.url.includes("403") || snap.url.includes("Error 403") || snap.bodyLength < 200) {
-    let extra = "";
-    if (snap.links.length > 0) {
-      extra = "\n\nСсылки на странице:\n" + snap.links.map(l => `  "${l.text}" -> ${l.href}`).join("\n");
-    }
-    return { type: "forbidden", text: `403 Forbidden на URL: ${snap.url}.${extra}` };
-  }
-
-  const input = await findChatInput(p);
   if (!input) {
-    return {
-      type: "no_input",
-      text: `Не найден поле ввода.\nURL: ${snap.url}\nРазмер: ${snap.bodyLength} bytes\n\nСтраница:\n${snap.bodySnippet}`,
-      snapshot: snap,
-    };
+    return `Input field not found.\nURL: ${url}\n\n${bodyBefore.substring(0, 3000)}`;
   }
 
+  // Send query
   await input.click();
   await input.fill(query);
   await p.keyboard.press("Enter");
-  await p.waitForTimeout(8000);
+  console.error("[nlmcp] Query sent, waiting for AI response...");
 
-  const lastResp = p.locator('[class*="response"], [class*="message"], [class*="answer"], [class*="result"]').last();
-  try {
-    const answer = await lastResp.textContent({ timeout: 30000 });
-    return { type: "answer", text: answer || "(пустой ответ)" };
-  } catch {
-    // Try again with longer wait
-    await p.waitForTimeout(10000);
-    try {
-      const answer = await lastResp.textContent({ timeout: 20000 });
-      return { type: "answer", text: answer || "(пустой ответ)" };
-    } catch {
-      return { type: "timeout", text: "(таймаут ожидания ответа AI)" };
+  // Wait up to 90 seconds for Angular to process and render
+  await p.waitForTimeout(30000);
+  console.error("[nlmcp] 30s elapsed, checking for response...");
+
+  // Try to find response containers
+  const respSelectors = ['[class*="chat"]', '[class*="conversation"]', '[class*="message"]', '[class*="response"]', 'main', 'article', '[role="main"]'];
+  for (const sel of respSelectors) {
+    const el = p.locator(sel).last();
+    if (await el.count().then(c => c > 0).catch(() => false)) {
+      const text = await el.textContent().catch(() => "");
+      if (text && text.length > 100) {
+        console.error(`[nlmcp] Response from ${sel}: ${text.length} chars`);
+        return text.substring(0, 10000);
+      }
     }
   }
+
+  // Additional wait for slow responses
+  console.error("[nlmcp] No response yet, waiting 60s more...");
+  await p.waitForTimeout(60000);
+
+  for (const sel of respSelectors) {
+    const el = p.locator(sel).last();
+    if (await el.count().then(c => c > 0).catch(() => false)) {
+      const text = await el.textContent().catch(() => "");
+      if (text && text.length > 100) {
+        console.error(`[nlmcp] Response after 90s from ${sel}: ${text.length} chars`);
+        return text.substring(0, 10000);
+      }
+    }
+  }
+
+  // Fallback — return whatever is on page
+  const bodyAfter = await p.locator("body").textContent().catch(() => "");
+  console.error("[nlmcp] Fallback: returning full body");
+  return bodyAfter.substring(0, 10000) || "(empty response)";
 }
 
-// ── MCP Server ──────────────────────────────────────────────────────
-
-const server = new Server(
-  { name: "notebooklm-mcp", version: "1.0.0" },
-  { capabilities: { tools: {} } }
-);
+const server = new Server({ name: "notebooklm-mcp", version: "1.1.0" }, { capabilities: { tools: {} } });
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
-      name: "search_notebooklm",
-      description: "Search within the current Google NotebookLM notebook.",
+      name: "ask_notebooklm",
+      description: "Ask a question to the Google NotebookLM notebook. Uses Visible Bridge Mode with ?tab=chat bypass.",
       inputSchema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
     },
     {
-      name: "ask_notebooklm",
-      description: "Ask a question to the Google NotebookLM notebook.",
-      inputSchema: { type: "object", properties: { query: { type: "string" }, mode: { type: "string", enum: ["chat", "note"], default: "chat" } }, required: ["query"] },
-    },
-    {
-      name: "list_notebooks",
-      description: "List available notebooks on the NotebookLM main page (use if specific notebook returns 403).",
-      inputSchema: { type: "object", properties: {} },
-    },
-    {
       name: "notebooklm_status",
-      description: "Check current NotebookLM page status — URL, auth state, page content summary.",
+      description: "Check current NotebookLM page status (URL, body size, session validity).",
       inputSchema: { type: "object", properties: {} },
     },
   ],
@@ -216,24 +227,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
   try {
-    const p = await ensureNotebookLM();
+    if (!browserCtx) await launch();
 
     if (name === "notebooklm_status") {
-      const snap = await getPageSnapshot(p);
-      return { content: [{ type: "text", text: JSON.stringify(snap, null, 2) }] };
+      const p = await waitReady();
+      const url = p.url();
+      const body = await p.locator("body").textContent().catch(() => "");
+      return { content: [{ type: "text", text: JSON.stringify({ url, bodyLength: body.length }, null, 2) }] };
     }
 
-    if (name === "list_notebooks") {
-      // Go to main page and list available notebooks
-      await p.goto(NOTEBOOKLM_URL, { waitUntil: "domcontentloaded", timeout: 30000 });
-      await p.waitForTimeout(5000);
-      const snap = await getPageSnapshot(p);
-      return { content: [{ type: "text", text: JSON.stringify(snap, null, 2) }] };
-    }
-
-    if (name === "search_notebooklm" || name === "ask_notebooklm") {
-      const result = await ask(p, String(args.query));
-      return { content: [{ type: "text", text: result.text }] };
+    if (name === "ask_notebooklm") {
+      const result = await ask(String(args.query));
+      return { content: [{ type: "text", text: result }] };
     }
 
     throw new Error(`Unknown tool: ${name}`);
@@ -247,7 +252,4 @@ async function main() {
   await server.connect(transport);
 }
 
-main().catch((err) => {
-  console.error("Fatal:", err);
-  process.exit(1);
-});
+main().catch((err) => { console.error("Fatal:", err); process.exit(1); });

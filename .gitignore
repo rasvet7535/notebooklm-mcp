@@ -1,6 +1,5 @@
-node_modules/
-firefox-profile/
-.env
+storageState.json
+ai-response.txt
+page-dump.txt
 *.log
-*.png
-page.html
+firefox-profile/

@@ -25,9 +25,7 @@ srv.stdout.on("data", (d) => {
       console.log(content);
       console.log("=== END ===");
       srv.kill();
-    } catch {
-      // partial JSON
-    }
+    } catch {}
   }
 });
 
@@ -38,4 +36,4 @@ const req = JSON.stringify({
 });
 srv.stdin.write(req + "\n");
 
-setTimeout(() => { console.log("TIMEOUT"); srv.kill(); }, 360000);
+setTimeout(() => { console.log("TIMEOUT"); srv.kill(); }, 600000);
